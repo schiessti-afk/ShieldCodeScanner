@@ -20,7 +20,7 @@ from scanner import analyze_content, scan_directory
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-MALICIOUS = FIXTURES / "malicious"
+TRUE_POSITIVES = FIXTURES / "true_positives"
 BENIGN = FIXTURES / "benign"
 
 
@@ -40,15 +40,15 @@ def _scan_file(path: Path) -> List[Finding]:
 
 class PythonAstTests(unittest.TestCase):
     def test_getenv_alias_is_tainted(self) -> None:
-        findings = _scan_file(MALICIOUS / "getenv_alias.py")
+        findings = _scan_file(TRUE_POSITIVES / "getenv_alias.py")
         self.assertIn("api_key_exfiltration", _patterns(findings))
 
     def test_attribute_write_reaches_sink(self) -> None:
-        findings = _scan_file(MALICIOUS / "attr_exfil.py")
+        findings = _scan_file(TRUE_POSITIVES / "attr_exfil.py")
         self.assertIn("api_key_exfiltration", _patterns(findings))
 
     def test_subprocess_kwargs_shell_true(self) -> None:
-        findings = _scan_file(MALICIOUS / "subprocess_kwargs.py")
+        findings = _scan_file(TRUE_POSITIVES / "subprocess_kwargs.py")
         self.assertIn("download_and_execute", _patterns(findings))
 
     def test_bare_getenv_token_same_call(self) -> None:
@@ -94,7 +94,7 @@ class ManifestWalkTests(unittest.TestCase):
         self.assertEqual(report.findings[0].line, 1)
 
     def test_husky_hook_is_walked(self) -> None:
-        text = (MALICIOUS / "husky_package.json").read_text(encoding="utf-8")
+        text = (TRUE_POSITIVES / "husky_package.json").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "package.json").write_text(text, encoding="utf-8")
@@ -102,7 +102,7 @@ class ManifestWalkTests(unittest.TestCase):
         self.assertIn("npm_lifecycle_execution", _patterns(report.findings))
 
     def test_pyproject_pdm_hook(self) -> None:
-        findings = _scan_file(MALICIOUS / "pyproject.toml")
+        findings = _scan_file(TRUE_POSITIVES / "pyproject.toml")
         self.assertIn("npm_lifecycle_execution", _patterns(findings))
 
     def test_benign_pyproject_is_clean(self) -> None:
@@ -153,7 +153,7 @@ class DestinationTests(unittest.TestCase):
 
 class IncidentTests(unittest.TestCase):
     def test_ssh_read_and_post_are_one_incident(self) -> None:
-        report = scan_directory(MALICIOUS)
+        report = scan_directory(TRUE_POSITIVES)
         ssh = [
             item
             for item in report.incidents
@@ -171,7 +171,7 @@ class IncidentTests(unittest.TestCase):
         self.assertEqual(incident.destination_hint, "attacker.example")
 
     def test_ip_destination_on_finding_and_incident(self) -> None:
-        report = scan_directory(MALICIOUS)
+        report = scan_directory(TRUE_POSITIVES)
         match = next(
             item
             for item in report.findings
@@ -188,14 +188,14 @@ class IncidentTests(unittest.TestCase):
         self.assertEqual(incident.destination_kind, "hardcoded_ip")
 
     def test_webhook_destination(self) -> None:
-        findings = _scan_file(MALICIOUS / "exfil_webhook.py")
+        findings = _scan_file(TRUE_POSITIVES / "exfil_webhook.py")
         match = next(item for item in findings if item.pattern == "api_key_exfiltration")
         self.assertEqual(match.destination_kind, "webhook")
         self.assertEqual(match.destination_hint, "discord.com")
 
     def test_incidents_are_deterministic(self) -> None:
-        first = scan_directory(MALICIOUS).to_dict()["incidents"]
-        second = scan_directory(MALICIOUS).to_dict()["incidents"]
+        first = scan_directory(TRUE_POSITIVES).to_dict()["incidents"]
+        second = scan_directory(TRUE_POSITIVES).to_dict()["incidents"]
         self.assertEqual(first, second)
 
     def test_cluster_merges_source_and_sink_rows(self) -> None:

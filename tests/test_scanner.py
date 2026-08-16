@@ -27,7 +27,7 @@ from utils import DEFAULT_MAX_FILE_SIZE, normalize_report_path  # noqa: E402
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-MALICIOUS = FIXTURES / "malicious"
+TRUE_POSITIVES = FIXTURES / "true_positives"
 BENIGN = FIXTURES / "benign"
 
 
@@ -43,7 +43,7 @@ def _scan_file(path: Path) -> List[Finding]:
 
 class TruePositiveTests(unittest.TestCase):
     def test_api_key_exfiltration(self) -> None:
-        findings = _scan_file(MALICIOUS / "exfil_api_key.py")
+        findings = _scan_file(TRUE_POSITIVES / "exfil_api_key.py")
         self.assertIn("api_key_exfiltration", _patterns(findings))
         match = next(item for item in findings if item.pattern == "api_key_exfiltration")
         self.assertEqual(match.severity, "critical")
@@ -51,14 +51,14 @@ class TruePositiveTests(unittest.TestCase):
         self.assertIn("requests.post", match.code_snippet)
 
     def test_ssh_key_exfiltration(self) -> None:
-        findings = _scan_file(MALICIOUS / "exfil_ssh.py")
+        findings = _scan_file(TRUE_POSITIVES / "exfil_ssh.py")
         self.assertIn("sensitive_file_exfiltration", _patterns(findings))
         match = next(item for item in findings if item.pattern == "sensitive_file_exfiltration")
         self.assertEqual(match.severity, "critical")
         self.assertIn("id_rsa", match.code_snippet + findings[0].code_snippet)
 
     def test_destructive_root_and_home_deletion(self) -> None:
-        findings = _scan_file(MALICIOUS / "rm_rf_root.sh")
+        findings = _scan_file(TRUE_POSITIVES / "rm_rf_root.sh")
         self.assertTrue(
             {"destructive_root_deletion", "destructive_path_deletion"} & _patterns(findings)
         )
@@ -67,19 +67,19 @@ class TruePositiveTests(unittest.TestCase):
         self.assertTrue("/" in snippets or "$HOME" in snippets or "~" in snippets)
 
     def test_python_home_rmtree(self) -> None:
-        findings = _scan_file(MALICIOUS / "rmtree_home.py")
+        findings = _scan_file(TRUE_POSITIVES / "rmtree_home.py")
         self.assertTrue(
             {"destructive_path_deletion", "destructive_root_deletion"} & _patterns(findings)
         )
         self.assertTrue(any(item.severity == "critical" for item in findings))
 
     def test_download_and_execute(self) -> None:
-        findings = _scan_file(MALICIOUS / "download_exec.sh")
+        findings = _scan_file(TRUE_POSITIVES / "download_exec.sh")
         self.assertTrue({"pipe_to_shell", "download_and_execute"} & _patterns(findings))
         self.assertTrue(any(item.severity in {"high", "critical"} for item in findings))
 
     def test_persistence_installation(self) -> None:
-        findings = _scan_file(MALICIOUS / "persistence.sh")
+        findings = _scan_file(TRUE_POSITIVES / "persistence.sh")
         self.assertTrue(
             {
                 "persistence_modification",
@@ -89,14 +89,14 @@ class TruePositiveTests(unittest.TestCase):
         )
 
     def test_obfuscated_command_execution(self) -> None:
-        findings = _scan_file(MALICIOUS / "obfuscated_exec.py")
+        findings = _scan_file(TRUE_POSITIVES / "obfuscated_exec.py")
         self.assertIn("obfuscated_execution", _patterns(findings))
         match = next(item for item in findings if item.pattern == "obfuscated_execution")
         self.assertEqual(match.severity, "high")
         self.assertIn("b64decode", match.code_snippet)
 
     def test_suspicious_powershell(self) -> None:
-        findings = _scan_file(MALICIOUS / "suspicious.ps1")
+        findings = _scan_file(TRUE_POSITIVES / "suspicious.ps1")
         patterns = _patterns(findings)
         self.assertTrue(
             {"encoded_powershell", "powershell_download_iex", "download_and_execute"}
@@ -104,20 +104,20 @@ class TruePositiveTests(unittest.TestCase):
         )
 
     def test_npm_postinstall_abuse(self) -> None:
-        findings = _scan_file(MALICIOUS / "package.json")
+        findings = _scan_file(TRUE_POSITIVES / "package.json")
         self.assertIn("npm_lifecycle_execution", _patterns(findings))
         match = next(item for item in findings if item.pattern == "npm_lifecycle_execution")
         self.assertIn(match.severity, {"high", "critical"})
         self.assertIn("postinstall", match.code_snippet)
 
-    def test_malicious_directory_is_flagged(self) -> None:
-        report = scan_directory(MALICIOUS)
+    def test_true_positives_directory_is_flagged(self) -> None:
+        report = scan_directory(TRUE_POSITIVES)
         self.assertEqual(report.status, "flagged")
         self.assertGreater(len(report.findings), 0)
         self.assertGreater(report.scanned_files, 0)
 
     def test_cross_file_api_key_exfiltration(self) -> None:
-        findings = _scan_file(MALICIOUS / "crossfile_sync.py")
+        findings = _scan_file(TRUE_POSITIVES / "crossfile_sync.py")
         self.assertIn("api_key_exfiltration", _patterns(findings))
         match = next(item for item in findings if item.pattern == "api_key_exfiltration")
         self.assertEqual(match.severity, "critical")
@@ -471,8 +471,8 @@ class RobustnessTests(unittest.TestCase):
 
 class EngineAndCliTests(unittest.TestCase):
     def test_findings_are_deterministic(self) -> None:
-        first = scan_directory(MALICIOUS).to_dict()
-        second = scan_directory(MALICIOUS).to_dict()
+        first = scan_directory(TRUE_POSITIVES).to_dict()
+        second = scan_directory(TRUE_POSITIVES).to_dict()
         self.assertEqual(first, second)
         findings = first["findings"]
         ordered = sorted(
@@ -566,7 +566,7 @@ class EngineAndCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_cli_file_instead_of_directory_is_error(self) -> None:
-        code = main([str(MALICIOUS / "exfil_api_key.py")])
+        code = main([str(TRUE_POSITIVES / "exfil_api_key.py")])
         self.assertEqual(code, 2)
 
     def test_cli_invalid_max_file_size(self) -> None:
@@ -610,7 +610,7 @@ class EngineAndCliTests(unittest.TestCase):
 
 class FindingContractTests(unittest.TestCase):
     def test_finding_fields_and_advisory_wording(self) -> None:
-        report = scan_directory(MALICIOUS)
+        report = scan_directory(TRUE_POSITIVES)
         self.assertTrue(report.findings)
         for finding in report.findings:
             self.assertIsInstance(finding.file, str)

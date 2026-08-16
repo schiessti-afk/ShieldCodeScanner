@@ -21,4 +21,5 @@ py-modules = [
     "python_ast",
     "manifests",
     "incidents",
+    "html_report",
 ]

@@ -17,6 +17,7 @@ import json
 import posixpath
 import re
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
@@ -49,6 +50,7 @@ from models import (
     SkippedFile,
 )
 from python_ast import AstEvent, analyze_python_ast
+from html_report import render_html
 from sarif import render_sarif
 from rules import (
     ComboRule,
@@ -72,6 +74,8 @@ from utils import (
     read_text_file,
     split_lines,
 )
+
+DEFAULT_HTML_OUTPUT = "shield-report.html"
 
 AMBIENT_WINDOW = 25
 AMBIENT_LANGUAGES = frozenset(
@@ -1162,8 +1166,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format",
         default="json",
-        choices=("json", "sarif"),
-        help="Report format: json (default) or sarif (GitHub/GitLab annotations)",
+        choices=("json", "sarif", "html"),
+        help=(
+            "Report format: json (default), sarif (GitHub/GitLab annotations), "
+            "or html (self-contained browser report)"
+        ),
     )
     parser.add_argument(
         "--max-file-size",
@@ -1210,12 +1217,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "scanned so cross-file taint stays accurate."
         ),
     )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help=(
+            "Open the HTML report in the default browser after writing it "
+            "(requires --format html and a report file path)"
+        ),
+    )
     return parser
 
 
 def render_report(report: ScanReport, fmt: str = "json") -> str:
     if fmt == "sarif":
         return render_sarif(report)
+    if fmt == "html":
+        return render_html(report)
     return json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n"
 
 
@@ -1231,6 +1248,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.max_file_size <= 0:
         print("error: --max-file-size must be a positive integer", file=sys.stderr)
+        return 2
+
+    if args.open and args.format != "html":
+        print("error: --open requires --format html", file=sys.stderr)
         return 2
 
     if args.no_baseline and args.baseline:
@@ -1329,11 +1350,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.output:
         output_path = Path(args.output)
+    elif args.format == "html":
+        output_path = Path(DEFAULT_HTML_OUTPUT)
+    else:
+        output_path = None
+
+    if output_path is not None:
         try:
             output_path.write_text(payload, encoding="utf-8")
         except OSError as exc:
             print(f"error: cannot write output file: {exc}", file=sys.stderr)
             return 2
+        if args.open:
+            try:
+                webbrowser.open(output_path.resolve().as_uri())
+            except OSError as exc:
+                print(f"error: cannot open report in browser: {exc}", file=sys.stderr)
+                return 2
     else:
         sys.stdout.write(payload)
 

