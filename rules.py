@@ -22,8 +22,10 @@ Assumptions about threat patterns
   sink is not reported (ordinary data-format use).
 * ``subprocess.run([...], check=True)`` without ``shell=True`` and without
   tainted input is not reported.
-* Cross-file dataflow is out of scope. Taint is forward, lexical, and
-  file-local, with simple assignment tracking rather than a full AST.
+* Taint is forward and lexical, with simple assignment tracking rather
+  than a full AST. Cross-file flow uses a static export/import index
+  (no execution): a function or module binding that returns a secret in
+  ``secrets.py`` can taint ``key = config.get_api_key()`` in ``sync.py``.
 * Language-specific regexes are restricted to matching file kinds so a
   Python ``os.system`` rule cannot fire inside a YAML comment by accident
   unless that file kind opted in.
@@ -337,6 +339,7 @@ SIGNAL_DEFS: List[SignalDef] = [
             r"|aiohttp\.(?:ClientSession|request)\s*\("
             r"|socket\.(?:send(?:all)?|connect|create_connection)\s*\("
             r"|paramiko\.|ftplib\.|smtplib\."
+            r"|\b(?:client|session)\.(?:get|post|put|patch|delete|request)\s*\("
             r")"
         ),
         description="Python network operation",

@@ -192,7 +192,7 @@ _PS_VAR_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 _ASSIGN_RES = {
     "python": re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$"),
     "javascript": re.compile(
-        r"^\s*(?:(?:const|let|var)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$"
+        r"^\s*(?:export\s+)?(?:(?:const|let|var)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$"
     ),
     "ruby": re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$"),
     "go": re.compile(

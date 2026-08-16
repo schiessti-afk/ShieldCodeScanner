@@ -109,12 +109,26 @@ Rules live in `rules.py` as:
 - **direct rules** — high-signal single lines (`rm -rf /`, `curl | sh`, encoded PowerShell)
 - **file rules** — structured parsers (currently `package.json` lifecycle scripts)
 
-The engine in `scanner.py` tracks simple forward, file-local assignments
-so this is reported even when the operations are on different lines:
+The engine in `scanner.py` tracks simple forward assignments so this is
+reported even when the operations are on different lines:
 
 ```python
 secret = os.environ["API_KEY"]
 requests.post(url, data=secret)
+```
+
+It also builds a lightweight **export/import index** (still no execution)
+so a getter defined in one file can taint a sink in another:
+
+```python
+# secrets.py
+def get_api_key():
+    return os.environ["API_KEY"]
+
+# sync.py
+from secrets import get_api_key
+key = get_api_key()
+client.post(url, data=key)
 ```
 
 ### Assumptions
@@ -131,7 +145,11 @@ requests.post(url, data=secret)
   are not reported; download-and-execute or credential-sending hooks are.
 - Base64 used as a data format, without execution, is not reported.
 - `subprocess.run(["git", "status"], check=True)` is not reported.
-- There is no cross-file taint tracking and no full AST for every language.
+- Cross-file taint uses a static index of module-level bindings and
+  functions that return tainted values, plus import/require resolution.
+  There is no full AST, no execution, and no interprocedural analysis
+  beyond that index (dynamic imports, `importlib`, and `getattr` are out
+  of scope).
 - Shell-family files also use a 25-line ambient window because assignment
   tracking is weaker there.
 - Wording is always advisory (“suspicious pattern detected”).
