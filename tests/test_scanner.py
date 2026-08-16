@@ -545,7 +545,7 @@ class EngineAndCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "clean")
-            self.assertEqual(payload["scanner_version"], "1.1.0")
+            self.assertEqual(payload["scanner_version"], "1.2.0")
             self.assertNotIn("timestamp", payload)
 
             (root / "bad.py").write_text(

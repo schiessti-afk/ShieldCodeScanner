@@ -1,0 +1,8 @@
+[project]
+name = "ordinary-hooks"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[tool.pdm.scripts]
+test = "python -m unittest discover -s tests -v"
+lint = "python -m compileall ."

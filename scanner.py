@@ -31,6 +31,15 @@ from baseline import (
     load_baseline,
     write_baseline,
 )
+from incidents import (
+    PATTERN_GROUPS,
+    PATTERN_SINK_KIND,
+    PATTERN_SOURCE_KIND,
+    attach_incidents,
+    classify_destination,
+    destination_from_text,
+    flow_for,
+)
 from models import (
     SCANNER_VERSION,
     SEVERITY_RANK,
@@ -39,6 +48,7 @@ from models import (
     SkipReason,
     SkippedFile,
 )
+from python_ast import AstEvent, analyze_python_ast
 from sarif import render_sarif
 from rules import (
     ComboRule,
@@ -86,30 +96,6 @@ SINK_SIGNAL_IDS = frozenset(
         "chmod_exec",
     }
 )
-
-# Findings that represent the same underlying behavior on one line are merged,
-# keeping the strongest severity. Distinct pattern IDs on different lines stay
-# separate.
-PATTERN_GROUPS = {
-    "destructive_root_deletion": "destructive",
-    "destructive_path_deletion": "destructive",
-    "privilege_destructive": "destructive",
-    "download_and_execute": "download_exec",
-    "pipe_to_shell": "download_exec",
-    "powershell_download_iex": "download_exec",
-    "privilege_download_execute": "download_exec",
-    "obfuscated_download_execution": "download_exec",
-    "standalone_file_download": "download_exec",
-    "obfuscated_execution": "obfuscated_exec",
-    "encoded_powershell": "obfuscated_exec",
-    "api_key_exfiltration": "exfil",
-    "sensitive_file_exfiltration": "exfil",
-    "sensitive_file_access": "exfil",
-    "persistence_modification": "persistence",
-    "persistence_with_remote_payload": "persistence",
-    "persistence_with_obfuscation": "persistence",
-    "npm_lifecycle_execution": "npm",
-}
 
 _WITH_AS_RE = re.compile(
     r"^\s*with\s+.+\bas\s+([A-Za-z_][A-Za-z0-9_]*)\s*:"
@@ -499,6 +485,38 @@ def _bind_js_imports(statement: str, importer_path: str, ctx: ImportContext) -> 
                 ctx.names.setdefault(match.group(2), set()).update(union)
 
 
+def _bind_ast_imports(report_path: str, text: str, ctx: ImportContext) -> bool:
+    """Bind Python imports from the AST. Returns False if the file did not parse."""
+    analysis = analyze_python_ast(text)
+    if analysis is None:
+        return False
+    for spec in analysis.import_specs:
+        if spec.is_from:
+            if spec.module:
+                resolved = resolve_module(
+                    ctx.index, spec.module, spec.relative_dots, report_path
+                )
+                _bind_resolved_names(ctx, resolved, spec.items)
+                continue
+            parent = resolve_module(ctx.index, "", spec.relative_dots, report_path)
+            parent_exports = ctx.index.all_exports(parent) if parent else {}
+            for exported, alias in spec.items:
+                if parent and exported in parent_exports:
+                    _bind_resolved_names(ctx, parent, [(exported, alias)])
+                    continue
+                sibling = resolve_module(
+                    ctx.index, exported, spec.relative_dots, report_path
+                )
+                if sibling is not None:
+                    ctx.imported_paths.add(sibling)
+            continue
+        for exported, _alias in spec.items:
+            resolved = resolve_module(ctx.index, exported, 0, report_path)
+            if resolved is not None:
+                ctx.imported_paths.add(resolved)
+    return True
+
+
 def bind_imports(
     report_path: str,
     language: str,
@@ -508,6 +526,8 @@ def bind_imports(
     """Parse import/require lines and attach exported taint from *index*."""
     ctx = ImportContext(index)
     if language not in INDEX_LANGUAGES:
+        return ctx
+    if language == "python" and _bind_ast_imports(report_path, text, ctx):
         return ctx
     lines = split_lines(text)
     for start_line, _end_line, statement in iter_logical_statements(lines, language):
@@ -525,6 +545,19 @@ def collect_module_exports(language: str, text: str) -> Dict[str, Set[str]]:
     """Return names this file exports, with taint kinds. Never executes *text*."""
     if language not in INDEX_LANGUAGES:
         return {}
+    regex_exports = _collect_module_exports_regex(language, text)
+    if language != "python":
+        return regex_exports
+    analysis = analyze_python_ast(text)
+    if analysis is None:
+        return regex_exports
+    merged: Dict[str, Set[str]] = {name: set(kinds) for name, kinds in regex_exports.items()}
+    for name, kinds in analysis.exports.items():
+        merged.setdefault(name, set()).update(kinds)
+    return {name: kinds for name, kinds in merged.items() if kinds}
+
+
+def _collect_module_exports_regex(language: str, text: str) -> Dict[str, Set[str]]:
     lines = split_lines(text)
     signal_defs = signals_for_language(language)
     tainted: Dict[str, Set[str]] = {}
@@ -634,13 +667,19 @@ def _used_taints(
     ambient: Sequence[Tuple[int, Set[str]]],
     line_no: int,
     import_ctx: Optional[ImportContext] = None,
+    extra_refs: Optional[Set[str]] = None,
 ) -> Set[str]:
     used = set(line_taints)
-    for name in identifiers_in(line, language):
+    names = identifiers_in(line, language)
+    if extra_refs:
+        names.update(extra_refs)
+    for name in names:
         if name in tainted:
             used.update(tainted[name])
     if import_ctx is not None:
         used.update(import_ctx.extra_taints(line))
+        if extra_refs:
+            used.update(import_ctx.extra_taints(" ".join(sorted(extra_refs))))
     if language in AMBIENT_LANGUAGES:
         for src_line, taints in ambient:
             if 0 < line_no - src_line <= AMBIENT_WINDOW:
@@ -657,10 +696,14 @@ def _taint_source_line(
     taint_origin: Dict[str, int],
     ambient: Sequence[Tuple[int, Set[str]]],
     line_no: int,
+    extra_refs: Optional[Set[str]] = None,
 ) -> Optional[int]:
     """Best-effort origin line for snippet context (not used as the finding line)."""
     origins: List[int] = []
-    for name in identifiers_in(line, language):
+    names = identifiers_in(line, language)
+    if extra_refs:
+        names.update(extra_refs)
+    for name in names:
         kinds = tainted.get(name)
         if kinds and any(item in kinds for item in required):
             origin = taint_origin.get(name)
@@ -711,6 +754,50 @@ def _apply_assignment(
             taint_origin[name] = line_no
 
 
+def _apply_ast_assignments(
+    event: AstEvent,
+    tainted: Dict[str, Set[str]],
+    taint_origin: Dict[str, int],
+    import_ctx: Optional[ImportContext],
+) -> None:
+    for assignment in event.assignments:
+        merged = set(assignment.taints) | set(tainted.get(assignment.name, ()))
+        for ref in assignment.refs:
+            if ref in tainted:
+                merged.update(tainted[ref])
+        if import_ctx is not None and assignment.refs:
+            merged.update(import_ctx.extra_taints(" ".join(sorted(assignment.refs))))
+        tainted[assignment.name] = merged
+        if merged:
+            taint_origin[assignment.name] = assignment.line
+        else:
+            taint_origin.pop(assignment.name, None)
+
+
+def _iter_analysis_units(lines: List[str], language: str, text: str):
+    """Yield ``(start, end, statement, ast_event)`` units for one file."""
+    if language == "python":
+        analysis = analyze_python_ast(text)
+        if analysis is not None:
+            for event in analysis.events:
+                start = max(1, event.line)
+                end = max(start, event.end_line)
+                end = min(end, len(lines)) if lines else start
+                statement = "\n".join(lines[start - 1 : end]) if lines else ""
+                yield start, end, statement, event
+            return
+    for start, end, statement in iter_logical_statements(lines, language):
+        yield start, end, statement, None
+
+
+def _destination_fields(raw: str, statement: str) -> Tuple[str, str]:
+    if raw:
+        kind, hint = classify_destination(raw)
+        if kind:
+            return kind, hint
+    return destination_from_text(statement)
+
+
 def _end_line(line_no: int, extra_lines: Optional[Iterable[int]]) -> int:
     if not extra_lines:
         return line_no
@@ -723,7 +810,18 @@ def _emit_combo(
     line_no: int,
     lines: List[str],
     extra_lines: Optional[Iterable[int]],
+    source_line: int = 0,
+    destination_kind: str = "",
+    destination_hint: str = "",
 ) -> Finding:
+    source_kind = rule.required_taints[0] if rule.required_taints else ""
+    flow = flow_for(
+        report_path,
+        source_line or line_no,
+        line_no,
+        source_kind,
+        rule.sink,
+    )
     return Finding(
         file=report_path,
         line=line_no,
@@ -732,6 +830,12 @@ def _emit_combo(
         description=rule.description,
         code_snippet=make_snippet(lines, line_no, extra_lines),
         end_line=_end_line(line_no, extra_lines),
+        source_line=source_line,
+        source_kind=source_kind,
+        sink_kind=rule.sink,
+        destination_kind=destination_kind,
+        destination_hint=destination_hint,
+        flow=flow,
     )
 
 
@@ -742,7 +846,11 @@ def _emit_direct(
     lines: List[str],
     severity: str,
     extra_lines: Optional[Iterable[int]] = None,
+    destination_kind: str = "",
+    destination_hint: str = "",
 ) -> Finding:
+    source_kind = PATTERN_SOURCE_KIND.get(rule.name, "")
+    sink_kind = PATTERN_SINK_KIND.get(rule.name, "")
     return Finding(
         file=report_path,
         line=line_no,
@@ -751,6 +859,10 @@ def _emit_direct(
         description=rule.description,
         code_snippet=make_snippet(lines, line_no, extra_lines),
         end_line=_end_line(line_no, extra_lines),
+        source_kind=source_kind,
+        sink_kind=sink_kind,
+        destination_kind=destination_kind,
+        destination_hint=destination_hint,
     )
 
 
@@ -789,13 +901,21 @@ def analyze_content(
             for name, kinds in import_ctx.names.items():
                 tainted.setdefault(name, set()).update(kinds)
 
-    for start_line, end_line, statement in iter_logical_statements(lines, language):
-        first_physical = lines[start_line - 1]
-        if is_comment_line(first_physical, language):
+    for start_line, end_line, statement, ast_event in _iter_analysis_units(
+        lines, language, text
+    ):
+        if start_line <= len(lines) and is_comment_line(lines[start_line - 1], language):
             continue
 
         line_taints: Set[str] = set()
         sinks: Set[str] = set()
+        extra_refs: Set[str] = set()
+        destination_raw = ""
+        if ast_event is not None:
+            line_taints.update(ast_event.taints)
+            sinks.update(ast_event.sinks)
+            extra_refs.update(ast_event.refs)
+            destination_raw = ast_event.destination
         for signal in signal_defs:
             if signal.regex.search(statement) is None:
                 continue
@@ -813,6 +933,8 @@ def analyze_content(
             start_line,
             import_ctx,
         )
+        if ast_event is not None:
+            _apply_ast_assignments(ast_event, tainted, taint_origin, import_ctx)
 
         if language in AMBIENT_LANGUAGES and line_taints:
             ambient.append((start_line, set(line_taints)))
@@ -827,8 +949,10 @@ def analyze_content(
             ambient,
             start_line,
             import_ctx,
+            extra_refs,
         )
         extra_lines = range(start_line, end_line + 1)
+        dest_kind, dest_hint = _destination_fields(destination_raw, statement)
         matched_taint_sets: List[Set[str]] = []
         ordered_combos = sorted(
             combo_rules, key=lambda item: (-len(item.required_taints), item.name)
@@ -851,12 +975,22 @@ def analyze_content(
                 taint_origin,
                 ambient,
                 start_line,
+                extra_refs,
             )
             snippet_extra = list(extra_lines)
             if extra:
                 snippet_extra.append(extra)
             findings.append(
-                _emit_combo(rule, report_path, start_line, lines, snippet_extra)
+                _emit_combo(
+                    rule,
+                    report_path,
+                    start_line,
+                    lines,
+                    snippet_extra,
+                    source_line=extra or 0,
+                    destination_kind=dest_kind,
+                    destination_hint=dest_hint,
+                )
             )
 
         for rule in direct_rules:
@@ -870,7 +1004,14 @@ def analyze_content(
                 severity = classified
             findings.append(
                 _emit_direct(
-                    rule, report_path, start_line, lines, severity, extra_lines
+                    rule,
+                    report_path,
+                    start_line,
+                    lines,
+                    severity,
+                    extra_lines,
+                    destination_kind=dest_kind,
+                    destination_hint=dest_hint,
                 )
             )
 
@@ -989,7 +1130,7 @@ def scan_directory(
     findings = dedupe_findings(findings)
     skipped.sort(key=lambda item: (item.file, item.reason))
     status = "flagged" if findings else "clean"
-    return ScanReport(
+    report = ScanReport(
         status=status,
         scanner_version=SCANNER_VERSION,
         scanned_files=scanned,
@@ -998,6 +1139,7 @@ def scan_directory(
         findings=findings,
         ignored_inline=ignored_inline,
     )
+    return attach_incidents(report)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1157,6 +1299,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         apply_baseline(report, baseline)
+        attach_incidents(report)
         if args.verbose:
             print(
                 f"baseline {baseline_path}: ignored {report.ignored_baseline}",
@@ -1170,6 +1313,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         apply_changed_files(report, set(changed))
+        attach_incidents(report)
         if args.verbose:
             print(
                 f"since {args.since}: {len(changed)} changed files, "

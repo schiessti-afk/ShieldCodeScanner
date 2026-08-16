@@ -113,6 +113,17 @@ def _result(finding: Finding) -> Dict[str, Any]:
         },
         "properties": {
             "severity": finding.severity,
+            **(
+                {"destination": finding.destination_kind}
+                if finding.destination_kind
+                else {}
+            ),
+            **(
+                {"destinationHint": finding.destination_hint}
+                if finding.destination_hint
+                else {}
+            ),
+            **({"flow": list(finding.flow)} if finding.flow else {}),
         },
     }
 
@@ -126,6 +137,8 @@ def report_to_sarif(report: ScanReport) -> Dict[str, Any]:
     ignored = report.to_dict().get("ignored")
     if ignored:
         run_properties["ignored"] = ignored
+    if report.incidents:
+        run_properties["incidents"] = [item.to_dict() for item in report.incidents]
     return {
         "$schema": SARIF_SCHEMA,
         "version": SARIF_VERSION,

@@ -1,6 +1,6 @@
 [project]
 name = "code-scanner"
-version = "1.1.0"
+version = "1.2.0"
 description = "Local static security scanner for source-code repositories"
 readme = "README.md"
 license = {text = "MIT"}
@@ -11,4 +11,14 @@ dependencies = []
 code-scanner = "scanner:main"
 
 [tool.setuptools]
-py-modules = ["scanner", "rules", "models", "utils", "baseline", "sarif"]
+py-modules = [
+    "scanner",
+    "rules",
+    "models",
+    "utils",
+    "baseline",
+    "sarif",
+    "python_ast",
+    "manifests",
+    "incidents",
+]

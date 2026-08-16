@@ -22,10 +22,15 @@ Assumptions about threat patterns
   sink is not reported (ordinary data-format use).
 * ``subprocess.run([...], check=True)`` without ``shell=True`` and without
   tainted input is not reported.
-* Taint is forward and lexical, with simple assignment tracking rather
-  than a full AST. Cross-file flow uses a static export/import index
-  (no execution): a function or module binding that returns a secret in
-  ``secrets.py`` can taint ``key = config.get_api_key()`` in ``sync.py``.
+* Python is analyzed with the stdlib ``ast`` module (parse only, never
+  ``exec``). That covers ``from os import getenv``, attribute writes
+  such as ``self.token = ...``, and ``subprocess.run(..., **{"shell": True})``.
+  Other languages still use lexical assignment tracking. Cross-file flow
+  uses a static export/import index (no execution): a function or module
+  binding that returns a secret in ``secrets.py`` can taint
+  ``key = config.get_api_key()`` in ``sync.py``.
+* Package manifests (``package.json``, ``pyproject.toml``) are walked as
+  structured documents, not as minified line-regex targets.
 * Language-specific regexes are restricted to matching file kinds so a
   Python ``os.system`` rule cannot fire inside a YAML comment by accident
   unless that file kind opted in.
@@ -39,13 +44,12 @@ import time and does not need to change.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Callable, FrozenSet, List, Optional, Pattern, Tuple
 
+from manifests import analyze_package_json, analyze_pyproject_toml
 from models import Finding
-from utils import make_snippet
 
 
 PY = frozenset({"python"})
@@ -67,7 +71,8 @@ SHELLISH = SHELL | PS | BATCH | CONFIG | frozenset({"vbscript"})
 _SECRET_NAME = (
     r"(?:"
     r"[A-Za-z0-9_]{0,40}(?:API_KEY|API_TOKEN|ACCESS_KEY|SECRET_KEY|"
-    r"PRIVATE_KEY|AUTH_TOKEN|PASSWORD|SECRET|CREDENTIAL|CONN_STR|CONNECTION_STRING)"
+    r"PRIVATE_KEY|AUTH_TOKEN|PASSWORD|SECRET|CREDENTIAL|CONN_STR|"
+    r"CONNECTION_STRING|TOKEN)"
     r"|AWS_[A-Za-z0-9_]{0,40}"
     r"|ANTHROPIC_[A-Za-z0-9_]{0,40}"
     r"|OPENAI_[A-Za-z0-9_]{0,40}"
@@ -93,6 +98,19 @@ _SENSITIVE_PATH = (
     r"|Windows\\.+(?:Vault|Credentials)"
     r")"
 )
+
+_SECRET_NAME_RE = re.compile(r"^(?:" + _SECRET_NAME + r")$")
+_SENSITIVE_PATH_RE = re.compile(_SENSITIVE_PATH, re.I)
+
+
+def is_secret_env_name(name: str) -> bool:
+    """Return True if *name* looks like a credential-bearing environment variable."""
+    return bool(name) and _SECRET_NAME_RE.match(name) is not None
+
+
+def is_sensitive_path(value: str) -> bool:
+    """Return True if *value* references a well-known credential file path."""
+    return bool(value) and _SENSITIVE_PATH_RE.search(value) is not None
 
 
 def _compile(pattern: str, flags: int = 0) -> Pattern[str]:
@@ -995,116 +1013,18 @@ DIRECT_RULES: List[DirectRule] = [
 ]
 
 
-def _suspicious_install_script(command: str) -> Optional[Tuple[str, str, str]]:
-    """Return (pattern, severity, description) if a lifecycle script is abusive."""
-    checks: List[Tuple[Pattern[str], str, str, str]] = [
-        (
-            _compile(r"(?i)(?:curl|wget)\b[^\n]{0,300}\|\s*(?:sudo\s+)?(?:ba)?sh\b"),
-            "npm_lifecycle_execution",
-            "high",
-            "Suspicious package lifecycle script detected: a preinstall/install/"
-            "postinstall/prepare hook downloads remote content and pipes it to a shell.",
-        ),
-        (
-            _compile(r"(?i)powershell[^\n]{0,80}-(?:enc|encodedcommand|e)\b"),
-            "npm_lifecycle_execution",
-            "high",
-            "Suspicious package lifecycle script detected: a lifecycle hook launches "
-            "encoded PowerShell.",
-        ),
-        (
-            _compile(
-                r"(?i)(?:curl|wget|invoke-webrequest).{0,200}"
-                r"(?:API_KEY|SECRET|TOKEN|PASSWORD|AWS_|ANTHROPIC_|OPENAI_)"
-            ),
-            "npm_lifecycle_execution",
-            "critical",
-            "Suspicious package lifecycle script detected: a lifecycle hook appears "
-            "to transmit secret-like values to a remote endpoint.",
-        ),
-        (
-            _compile(
-                r"(?i)(?:crontab|\.bashrc|\.zshrc|LaunchAgents|"
-                r"CurrentVersion\\\\Run|schtasks)"
-            ),
-            "npm_lifecycle_execution",
-            "high",
-            "Suspicious package lifecycle script detected: a lifecycle hook appears "
-            "to modify a persistence location.",
-        ),
-        (
-            _compile(r"(?i)(?:IEX|Invoke-Expression|eval\s*\(|node\s+-e\s+.*http)"),
-            "npm_lifecycle_execution",
-            "high",
-            "Suspicious package lifecycle script detected: a lifecycle hook uses "
-            "dynamic evaluation together with remote content.",
-        ),
-    ]
-    for regex, pattern, severity, description in checks:
-        if regex.search(command):
-            return pattern, severity, description
-    return None
-
-
-def analyze_package_json(
-    report_path: str, text: str, lines: List[str]
-) -> List[Finding]:
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(data, dict):
-        return []
-    scripts = data.get("scripts")
-    if not isinstance(scripts, dict):
-        return []
-
-    lifecycle = {
-        "preinstall",
-        "install",
-        "postinstall",
-        "prepare",
-        "preuninstall",
-        "postuninstall",
-        "prepublish",
-        "prepublishOnly",
-    }
-    findings: List[Finding] = []
-    seen_lines: set = set()
-    for name, command in scripts.items():
-        if name not in lifecycle or not isinstance(command, str):
-            continue
-        hit = _suspicious_install_script(command)
-        if hit is None:
-            continue
-        pattern, severity, description = hit
-        line_no = 1
-        for idx, line in enumerate(lines, start=1):
-            if name in line or command[: min(40, len(command))] in line:
-                line_no = idx
-                break
-        if (line_no, pattern) in seen_lines:
-            continue
-        seen_lines.add((line_no, pattern))
-        findings.append(
-            Finding(
-                file=report_path,
-                line=line_no,
-                pattern=pattern,
-                severity=severity,
-                description=description,
-                code_snippet=make_snippet(lines, line_no),
-            )
-        )
-    return findings
-
-
 FILE_RULES: List[FileRule] = [
     FileRule(
         name="npm_lifecycle_execution",
         languages=frozenset({"package_json"}),
         filenames=frozenset({"package.json"}),
         analyzer=analyze_package_json,
+    ),
+    FileRule(
+        name="npm_lifecycle_execution",
+        languages=frozenset({"python_deps"}),
+        filenames=frozenset({"pyproject.toml"}),
+        analyzer=analyze_pyproject_toml,
     ),
 ]
 
