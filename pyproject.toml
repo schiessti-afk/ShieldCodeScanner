@@ -1,0 +1,13 @@
+[project]
+name = "code-scanner"
+version = "1.0.0"
+description = "Local static security scanner for source-code repositories"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+code-scanner = "scanner:main"
+
+[tool.setuptools]
+py-modules = ["scanner", "rules", "models", "utils"]

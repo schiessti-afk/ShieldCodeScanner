@@ -1,0 +1,9 @@
+{
+  "name": "ordinary-package",
+  "version": "1.0.0",
+  "scripts": {
+    "prepare": "husky install",
+    "postinstall": "node-gyp rebuild",
+    "build": "tsc --build"
+  }
+}
