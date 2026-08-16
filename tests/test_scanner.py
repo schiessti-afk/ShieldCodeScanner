@@ -458,10 +458,10 @@ class RobustnessTests(unittest.TestCase):
             (root / "bad.py").write_text("print(2)\n", encoding="utf-8")
             original = analyze_content
 
-            def flaky(report_path, language, filename, text):
+            def flaky(report_path, language, filename, text, *args, **kwargs):
                 if filename == "bad.py":
                     raise RuntimeError("boom")
-                return original(report_path, language, filename, text)
+                return original(report_path, language, filename, text, *args, **kwargs)
 
             with patch("scanner.analyze_content", side_effect=flaky):
                 report = scan_directory(root)
@@ -545,7 +545,7 @@ class EngineAndCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "clean")
-            self.assertEqual(payload["scanner_version"], "1.0.0")
+            self.assertEqual(payload["scanner_version"], "1.1.0")
             self.assertNotIn("timestamp", payload)
 
             (root / "bad.py").write_text(

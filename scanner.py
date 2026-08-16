@@ -5,8 +5,8 @@ never executes, imports, compiles, or modifies scanned files, never contacts
 URLs found in repositories, and never blocks, deletes, or quarantines code.
 
 Exit codes:
-    0  no findings
-    1  findings detected
+    0  no new findings (after inline, baseline, and --since filters)
+    1  one or more new findings
     2  scanner or input error
 """
 
@@ -20,6 +20,17 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
+from baseline import (
+    BaselineError,
+    GitError,
+    apply_baseline,
+    apply_changed_files,
+    default_baseline_path,
+    filter_inline_suppressions,
+    git_changed_files,
+    load_baseline,
+    write_baseline,
+)
 from models import (
     SCANNER_VERSION,
     SEVERITY_RANK,
@@ -28,6 +39,7 @@ from models import (
     SkipReason,
     SkippedFile,
 )
+from sarif import render_sarif
 from rules import (
     ComboRule,
     DirectRule,
@@ -38,10 +50,12 @@ from rules import (
     signals_for_language,
 )
 from utils import (
+    BASELINE_FILENAME,
     DEFAULT_MAX_FILE_SIZE,
     detect_language,
     extract_assignment,
     identifiers_in,
+    is_comment_line,
     iter_scannable_files,
     make_snippet,
     normalize_report_path,
@@ -101,24 +115,6 @@ _WITH_AS_RE = re.compile(
     r"^\s*with\s+.+\bas\s+([A-Za-z_][A-Za-z0-9_]*)\s*:"
 )
 
-_COMMENT_PREFIXES = {
-    "python": ("#",),
-    "shell": ("#",),
-    "makefile": ("#",),
-    "dockerfile": ("#",),
-    "ruby": ("#",),
-    "python_deps": ("#",),
-    "dotenv": ("#",),
-    "config": ("#",),
-    "javascript": ("//", "/*"),
-    "go": ("//", "/*"),
-    "rust": ("//", "/*"),
-    "swift": ("//", "/*"),
-    "powershell": ("#",),
-    "batch": ("rem ", "::"),
-}
-
-
 STATEMENT_GROUP_LANGUAGES = frozenset(
     {
         "python",
@@ -164,15 +160,6 @@ _IMPORT_NAME_RE = re.compile(
 _JS_IMPORT_ITEM_RE = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$"
 )
-
-
-def _is_comment_line(line: str, language: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return True
-    prefixes = _COMMENT_PREFIXES.get(language, ())
-    lowered = stripped.lower()
-    return any(lowered.startswith(prefix) for prefix in prefixes)
 
 
 def _paren_delta(text: str) -> int:
@@ -525,7 +512,7 @@ def bind_imports(
     lines = split_lines(text)
     for start_line, _end_line, statement in iter_logical_statements(lines, language):
         first = lines[start_line - 1]
-        if _is_comment_line(first, language):
+        if is_comment_line(first, language):
             continue
         if language == "python":
             _bind_python_imports(statement, report_path, ctx)
@@ -548,7 +535,7 @@ def collect_module_exports(language: str, text: str) -> Dict[str, Set[str]]:
 
     for start_line, _end_line, statement in iter_logical_statements(lines, language):
         first = lines[start_line - 1]
-        if _is_comment_line(first, language):
+        if is_comment_line(first, language):
             continue
 
         indent = _leading_indent(first)
@@ -566,7 +553,7 @@ def collect_module_exports(language: str, text: str) -> Dict[str, Set[str]]:
 
         physical_lines = statement.splitlines() or [statement]
         for offset, physical in enumerate(physical_lines):
-            if _is_comment_line(physical, language):
+            if is_comment_line(physical, language):
                 continue
             line_taints: Set[str] = set()
             for signal in signal_defs:
@@ -724,6 +711,12 @@ def _apply_assignment(
             taint_origin[name] = line_no
 
 
+def _end_line(line_no: int, extra_lines: Optional[Iterable[int]]) -> int:
+    if not extra_lines:
+        return line_no
+    return max(line_no, max(extra_lines))
+
+
 def _emit_combo(
     rule: ComboRule,
     report_path: str,
@@ -738,6 +731,7 @@ def _emit_combo(
         severity=rule.severity,
         description=rule.description,
         code_snippet=make_snippet(lines, line_no, extra_lines),
+        end_line=_end_line(line_no, extra_lines),
     )
 
 
@@ -756,6 +750,7 @@ def _emit_direct(
         severity=severity,
         description=rule.description,
         code_snippet=make_snippet(lines, line_no, extra_lines),
+        end_line=_end_line(line_no, extra_lines),
     )
 
 
@@ -796,7 +791,7 @@ def analyze_content(
 
     for start_line, end_line, statement in iter_logical_statements(lines, language):
         first_physical = lines[start_line - 1]
-        if _is_comment_line(first_physical, language):
+        if is_comment_line(first_physical, language):
             continue
 
         line_taints: Set[str] = set()
@@ -933,6 +928,7 @@ def scan_directory(
     skipped: List[SkippedFile] = []
     scanned = 0
     loaded: List[_LoadedFile] = []
+    ignored_inline = 0
 
     for path in iter_scannable_files(root):
         report_path = normalize_report_path(path, root)
@@ -984,6 +980,10 @@ def scan_directory(
             if verbose:
                 print(f"error {item.report_path}: {exc}", file=sys.stderr)
             continue
+        file_findings, n_ignored = filter_inline_suppressions(
+            file_findings, item.text, item.language
+        )
+        ignored_inline += n_ignored
         findings.extend(file_findings)
 
     findings = dedupe_findings(findings)
@@ -996,6 +996,7 @@ def scan_directory(
         skipped_files=len(skipped),
         skipped=skipped,
         findings=findings,
+        ignored_inline=ignored_inline,
     )
 
 
@@ -1019,8 +1020,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--format",
         default="json",
-        choices=("json",),
-        help="Report format (only json is supported)",
+        choices=("json", "sarif"),
+        help="Report format: json (default) or sarif (GitHub/GitLab annotations)",
     )
     parser.add_argument(
         "--max-file-size",
@@ -1034,10 +1035,45 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print diagnostic messages to stderr",
     )
+    parser.add_argument(
+        "--baseline",
+        metavar="FILE",
+        help=(
+            "Ignore accepted findings listed in FILE. "
+            f"If omitted, {BASELINE_FILENAME} in the scan root is loaded when present."
+        ),
+    )
+    parser.add_argument(
+        "--no-baseline",
+        action="store_true",
+        help="Do not load a baseline file",
+    )
+    parser.add_argument(
+        "--update-baseline",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Write current findings (after inline suppressions) to FILE. "
+            f"Default: {BASELINE_FILENAME} in the scan root."
+        ),
+    )
+    parser.add_argument(
+        "--since",
+        metavar="REF",
+        help=(
+            "Only report findings in files changed since git REF "
+            "(for example HEAD~1 or origin/main). The full tree is still "
+            "scanned so cross-file taint stays accurate."
+        ),
+    )
     return parser
 
 
-def render_report(report: ScanReport) -> str:
+def render_report(report: ScanReport, fmt: str = "json") -> str:
+    if fmt == "sarif":
+        return render_sarif(report)
     return json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n"
 
 
@@ -1053,6 +1089,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.max_file_size <= 0:
         print("error: --max-file-size must be a positive integer", file=sys.stderr)
+        return 2
+
+    if args.no_baseline and args.baseline:
+        print("error: --baseline and --no-baseline cannot be used together", file=sys.stderr)
         return 2
 
     root = Path(args.path)
@@ -1073,7 +1113,72 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_file_size=args.max_file_size,
             verbose=args.verbose,
         )
-        payload = render_report(report)
+    except Exception as exc:  # noqa: BLE001 — unexpected scanner failure
+        print(f"error: scanner failed: {exc}", file=sys.stderr)
+        return 2
+
+    if args.update_baseline is not None:
+        baseline_out = (
+            Path(args.update_baseline)
+            if args.update_baseline
+            else default_baseline_path(root)
+        )
+        try:
+            write_baseline(baseline_out, report.findings)
+        except OSError as exc:
+            print(f"error: cannot write baseline file: {exc}", file=sys.stderr)
+            return 2
+        if args.verbose:
+            print(
+                f"wrote baseline {baseline_out} ({len(report.findings)} findings)",
+                file=sys.stderr,
+            )
+
+    baseline_path: Optional[Path] = None
+    if not args.no_baseline:
+        if args.baseline:
+            baseline_path = Path(args.baseline)
+        else:
+            candidate = default_baseline_path(root)
+            if candidate.is_file():
+                baseline_path = candidate
+        if args.update_baseline is not None:
+            written = (
+                Path(args.update_baseline)
+                if args.update_baseline
+                else default_baseline_path(root)
+            )
+            baseline_path = written
+
+    if baseline_path is not None:
+        try:
+            baseline = load_baseline(baseline_path)
+        except BaselineError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        apply_baseline(report, baseline)
+        if args.verbose:
+            print(
+                f"baseline {baseline_path}: ignored {report.ignored_baseline}",
+                file=sys.stderr,
+            )
+
+    if args.since:
+        try:
+            changed = git_changed_files(root, args.since)
+        except GitError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        apply_changed_files(report, set(changed))
+        if args.verbose:
+            print(
+                f"since {args.since}: {len(changed)} changed files, "
+                f"ignored {report.ignored_unchanged} unchanged",
+                file=sys.stderr,
+            )
+
+    try:
+        payload = render_report(report, args.format)
     except Exception as exc:  # noqa: BLE001 — unexpected scanner failure
         print(f"error: scanner failed: {exc}", file=sys.stderr)
         return 2

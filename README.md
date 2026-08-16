@@ -43,6 +43,9 @@ JSON is written to stdout. Optional flags:
 ```bash
 python scanner.py /path/to/project --output report.json
 python scanner.py /path/to/project --format json --max-file-size 5242880 --verbose
+python scanner.py /path/to/project --baseline scanner-baseline.json
+python scanner.py /path/to/project --update-baseline
+python scanner.py /path/to/project --since HEAD~1 --format sarif --output report.sarif
 ```
 
 `--verbose` diagnostics go to stderr so stdout stays machine-readable.
@@ -51,18 +54,21 @@ python scanner.py /path/to/project --format json --max-file-size 5242880 --verbo
 
 | Code | Meaning |
 |------|---------|
-| 0 | no findings |
-| 1 | one or more findings |
+| 0 | no **new** findings |
+| 1 | one or more new findings |
 | 2 | scanner or input error |
 
-Exit status does not encode severity.
+Exit status does not encode severity. Inline suppressions, a committed
+baseline, and `--since` are applied before the exit code is chosen, so
+`1` means “this run introduced something unaccepted,” not “the tree has
+ever contained `curl | sh`.”
 
 ## Output
 
 ```json
 {
   "status": "flagged",
-  "scanner_version": "1.0.0",
+  "scanner_version": "1.1.0",
   "scanned_files": 142,
   "skipped_files": 3,
   "findings": [
@@ -78,9 +84,75 @@ Exit status does not encode severity.
 }
 ```
 
-`status` is `clean` when there are zero findings, otherwise `flagged`.
-Reports are deterministic: no timestamps, stable finding order, and `/`
-path separators even on Windows.
+`status` is `clean` when there are zero **reported** findings, otherwise
+`flagged`. Reports are deterministic: no timestamps, stable finding
+order, and `/` path separators even on Windows.
+
+When findings are dropped by an ignore comment, a baseline, or `--since`,
+the report may include an `ignored` object with `inline`, `baseline`,
+and/or `unchanged` counts.
+
+### Baseline
+
+Commit `scanner-baseline.json` in the repository root to record findings
+a reviewer has accepted. Each entry is identified by a SHA-256 of
+`file + line + pattern`:
+
+```json
+{
+  "version": 1,
+  "scanner_version": "1.1.0",
+  "findings": [
+    {
+      "id": "…",
+      "file": "src/sync.py",
+      "line": 47,
+      "pattern": "api_key_exfiltration"
+    }
+  ]
+}
+```
+
+```bash
+python scanner.py . --update-baseline
+```
+
+writes the current findings (after inline suppressions) to
+`scanner-baseline.json`. Later scans load that file automatically.
+`--baseline FILE` selects another path; `--no-baseline` skips it.
+
+### Inline suppressions
+
+A comment on the finding line, the previous line, or any line of a
+grouped statement accepts that match:
+
+```python
+# code-scanner: ignore api_key_exfiltration
+requests.post(url, data=secret)
+```
+
+```javascript
+fetch(url, { method: "POST", body: key }); // code-scanner: ignore api_key_exfiltration
+```
+
+`# code-scanner: ignore` (no pattern) ignores every finding on that
+line. `# code-scanner: ignore-next-line pattern` applies to the next
+non-blank line. The same directive works with `//` and `/* */` in
+JavaScript-family files.
+
+### Diff mode and SARIF
+
+`--since REF` still scans the full tree (so cross-file taint works) but
+only **reports** findings in files `git diff` lists as changed since
+`REF` (plus untracked files). Typical CI:
+
+```bash
+python scanner.py . --since origin/main --format sarif --output report.sarif
+```
+
+`--format sarif` writes SARIF 2.1.0 so GitHub and GitLab can annotate
+the exact lines. Combined with a baseline, exit code `1` is “new
+findings on this change set.”
 
 ## What is scanned
 
@@ -91,8 +163,8 @@ Important names and config extensions such as `package.json`,
 `requirements.txt`, `Dockerfile`, `.env`, `.env.*`, `*.yml`, `*.json`,
 and `*.toml` are also inspected.
 
-These directories are skipped entirely (edit `SKIP_DIRECTORIES` in
-`utils.py` to extend the list):
+`scanner-baseline.json` is not scanned. These directories are skipped
+entirely (edit `SKIP_DIRECTORIES` in `utils.py` to extend the list):
 
 `.git`, `node_modules`, `venv`, `.venv`, `env`, `.env`, `__pycache__`,
 `.pytest_cache`, `.mypy_cache`, `.tox`, `dist`, `build`, `target`,
@@ -182,11 +254,19 @@ python -m unittest discover -s tests -v
 ├── rules.py        # signals, combo/direct/file rules
 ├── models.py       # Finding / ScanReport
 ├── utils.py        # traversal, binary detection, snippets
+├── baseline.py     # fingerprints, ignore comments, --since
+├── sarif.py        # SARIF 2.1.0 renderer
 ├── tests/
 │   ├── test_scanner.py
+│   ├── test_baseline_ci.py
 │   └── fixtures/
 │       ├── malicious/
 │       └── benign/
 ├── README.md
+├── LICENSE
 └── pyproject.toml
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

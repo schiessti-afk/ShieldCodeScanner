@@ -38,6 +38,31 @@ DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 BINARY_SAMPLE_SIZE = 8192
 MAX_SNIPPET_CHARS = 500
 SNIPPET_RADIUS = 1
+BASELINE_FILENAME = "scanner-baseline.json"
+
+# Exact filenames skipped during traversal (reports, committed baselines).
+SKIP_FILENAMES: FrozenSet[str] = frozenset(
+    {
+        BASELINE_FILENAME,
+    }
+)
+
+COMMENT_PREFIXES = {
+    "python": ("#",),
+    "shell": ("#",),
+    "makefile": ("#",),
+    "dockerfile": ("#",),
+    "ruby": ("#",),
+    "python_deps": ("#",),
+    "dotenv": ("#",),
+    "config": ("#",),
+    "javascript": ("//", "/*"),
+    "go": ("//", "/*"),
+    "rust": ("//", "/*"),
+    "swift": ("//", "/*"),
+    "powershell": ("#",),
+    "batch": ("rem ", "::"),
+}
 
 CODE_EXTENSIONS: FrozenSet[str] = frozenset(
     {
@@ -223,10 +248,22 @@ def is_env_filename(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
+def is_comment_line(line: str, language: str) -> bool:
+    """Return True for blank lines or lines that are only a comment."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    prefixes = COMMENT_PREFIXES.get(language, ())
+    lowered = stripped.lower()
+    return any(lowered.startswith(prefix) for prefix in prefixes)
+
+
 def should_scan_file(path: Path) -> bool:
     """Return True if filename/extension rules say this file is in scope."""
     name = path.name
     lower = name.lower()
+    if lower in SKIP_FILENAMES:
+        return False
     if lower in EXACT_FILENAMES or is_env_filename(name):
         return True
     suffix = path.suffix.lower()

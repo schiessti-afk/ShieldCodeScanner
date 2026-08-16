@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any, Dict, List
 
 
-SCANNER_VERSION = "1.0.0"
+SCANNER_VERSION = "1.1.0"
 
 SEVERITY_RANK = {
     "critical": 0,
@@ -48,6 +48,7 @@ class Finding:
     severity: str
     description: str
     code_snippet: str
+    end_line: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -77,6 +78,9 @@ class ScanReport:
     scanner_version: str = SCANNER_VERSION
     skipped_files: int = 0
     skipped: List[SkippedFile] = field(default_factory=list)
+    ignored_inline: int = 0
+    ignored_baseline: int = 0
+    ignored_unchanged: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -88,4 +92,13 @@ class ScanReport:
         }
         if self.skipped:
             payload["skipped"] = [item.to_dict() for item in self.skipped]
+        ignored: Dict[str, int] = {}
+        if self.ignored_inline:
+            ignored["inline"] = self.ignored_inline
+        if self.ignored_baseline:
+            ignored["baseline"] = self.ignored_baseline
+        if self.ignored_unchanged:
+            ignored["unchanged"] = self.ignored_unchanged
+        if ignored:
+            payload["ignored"] = ignored
         return payload
